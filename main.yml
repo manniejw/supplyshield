@@ -1,0 +1,21 @@
+name: SupplyShield Alert Scan
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ls -la
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: node scan.mjs
+        env:
+          BASE44_EMAIL: ${{ secrets.BASE44_EMAIL }}
+          BASE44_PASSWORD: ${{ secrets.BASE44_PASSWORD }}
