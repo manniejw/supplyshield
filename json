@@ -1,6 +1,0 @@
-{
-  "type": "module",
-  "dependencies": {
-    "@base44/sdk": "latest"
-  }
-}
