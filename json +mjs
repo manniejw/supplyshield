@@ -1,0 +1,130 @@
+{
+  "type": "module",
+  "dependencies": {
+    "@base44/sdk": "latest"
+  }
+}import { createClient } from "@base44/sdk";
+
+const APP_ID = "6a2ec8b0271029bcbef9cacd";
+
+function isTooSimilar(newTitle, existingTitles) {
+  const norm = t => t.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+  const words = t => new Set(norm(t).split(" ").filter(w => w.length > 3));
+  const newWords = words(newTitle);
+  return existingTitles.some(existing => {
+    const overlap = [...words(existing)].filter(w => newWords.has(w)).length;
+    return overlap / Math.max(newWords.size, 1) >= 0.6;
+  });
+}
+
+async function main() {
+  const base44 = createClient({ appId: APP_ID });
+  await base44.auth.loginViaEmailPassword(
+    process.env.BASE44_EMAIL,
+    process.env.BASE44_PASSWORD
+  );
+
+  const [suppliers, products, existingAlerts] = await Promise.all([
+    base44.entities.Supplier.list(),
+    base44.entities.Product.list(),
+    base44.entities.Alert.filter({ status: "active" }, "-created_date", 100),
+  ]);
+
+  console.log(`Loaded: ${suppliers.length} suppliers, ${products.length} products, ${existingAlerts.length} active alerts`);
+
+  if (!suppliers.length) { console.log("No suppliers, skipping"); return; }
+
+  const existingTitles = existingAlerts.map(a => a.title);
+  const supplierSummary = suppliers
+    .map(s => `- ${s.name} (${s.country}, ${s.tier || "?"}) supplies: ${(s.parts_materials || []).join(", ")}`)
+    .join("\n");
+
+  const result = await base44.integrations.Core.InvokeLLM({
+    prompt: `You are a supply chain risk analyst. Search the internet for CONFIRMED disruption events from the PAST 30 DAYS affecting these suppliers:
+
+${supplierSummary}
+
+Search for: extreme weather closing ports or factories, port strikes or congestion, labor disputes, new sanctions or trade restrictions, infrastructure failures, major bankruptcies, shipping lane disruptions.
+
+STRICT RULES — only include an event when ALL apply:
+1. Confirmed by: Reuters, Bloomberg, AP, BBC, Financial Times, WSJ, CNBC, Nikkei, or official government/port authority
+2. Occurred or announced in the PAST 30 DAYS with ACTUAL supply chain impact
+3. Not already covered: [${existingTitles.slice(0, 15).join(" | ")}]
+4. affected_region must be a specific country name — never "Asia", "Europe", etc.
+
+If you cannot name the credible source, exclude the event entirely. Return 2-6 confirmed events.`,
+    add_context_from_internet: true,
+    response_json_schema: {
+      type: "object",
+      properties: {
+        alerts: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              title:                   { type: "string" },
+              description:             { type: "string" },
+              severity:                { type: "string", enum: ["low","medium","high","critical"] },
+              category:                { type: "string", enum: ["weather","geopolitical","logistics","labor","regulatory","infrastructure","financial","health","trade_policy"] },
+              timeframe:               { type: "string", enum: ["short_term","medium_term","long_term"] },
+              affected_region:         { type: "string" },
+              impact_summary:          { type: "string" },
+              recommendations:         { type: "array", items: { type: "string" } },
+              estimated_duration_days: { type: "number" },
+              source_url:              { type: "string" },
+              confirmed_source:        { type: "string" }
+            },
+            required: ["title","description","severity","category","affected_region","confirmed_source"]
+          }
+        }
+      }
+    }
+  });
+
+  const raw = Array.isArray(result?.alerts) ? result.alerts : [];
+  const confirmed = raw.filter(d => d.confirmed_source?.trim().length > 2);
+  console.log(`${raw.length} events found, ${confirmed.length} passed quality gate`);
+
+  let created = 0;
+  for (const alert of confirmed) {
+    if (isTooSimilar(alert.title, existingTitles)) {
+      console.log(`Skipping duplicate: "${alert.title}"`); continue;
+    }
+
+    const affectedSupplierIds = suppliers
+      .filter(s => s.country === alert.affected_region || s.region === alert.affected_region)
+      .map(s => s.id);
+
+    const affectedProductIds = products
+      .filter(p => (p.supplier_ids || []).some(sid => affectedSupplierIds.includes(sid)))
+      .map(p => p.id);
+
+    if (!affectedSupplierIds.length && alert.severity !== "critical") {
+      console.log(`Skipping (no matched suppliers): "${alert.title}"`); continue;
+    }
+
+    await base44.entities.Alert.create({
+      title:                   alert.title,
+      description:             alert.description,
+      category:                alert.category,
+      severity:                alert.severity,
+      timeframe:               alert.timeframe || "medium_term",
+      affected_region:         alert.affected_region,
+      source_url:              alert.source_url || alert.confirmed_source || "",
+      estimated_duration_days: alert.estimated_duration_days || 0,
+      affected_supplier_ids:   affectedSupplierIds,
+      affected_product_ids:    affectedProductIds,
+      impact_summary:          alert.impact_summary || "",
+      recommendations:         alert.recommendations || [],
+      status:                  "active",
+    });
+
+    existingTitles.push(alert.title);
+    created++;
+    console.log(`Created: "${alert.title}"`);
+  }
+
+  console.log(`Done. Created ${created} alert(s).`);
+}
+
+main().catch(err => { console.error(err.message); process.exit(1); });
